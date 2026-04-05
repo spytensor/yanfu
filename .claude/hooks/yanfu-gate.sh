@@ -44,6 +44,13 @@ if [ "${YANFU_SKIP:-0}" = "1" ]; then
   exit 0
 fi
 
+# Project opt-in check: only run if this project has yanfu installed.
+# This allows the hook to be configured globally without affecting
+# projects that haven't opted in.
+if [ ! -f ".claude/agents/yanfu-qa.md" ]; then
+  exit 0
+fi
+
 # ============================================================
 # Read Stop hook input from stdin (JSON)
 # ============================================================
