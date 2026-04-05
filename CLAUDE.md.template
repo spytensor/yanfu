@@ -1,0 +1,33 @@
+## yanfu E2E Validation
+
+This project uses yanfu for automated E2E validation. When you finish a task and try to complete, a QA validation agent will automatically verify your work.
+
+### What happens when you say "Done"
+
+1. A Stop hook intercepts your completion
+2. A separate QA agent analyzes your changes
+3. The QA agent validates affected layers:
+   - **Frontend changes** -> Opens the browser, checks rendering, simulates interaction
+   - **API changes** -> Hits endpoints with real requests, verifies responses
+   - **Database changes** -> Queries the DB to verify data persistence
+   - **All changes** -> Runs typecheck, lint, and unit tests
+4. If validation fails, you'll receive specific feedback and must fix the issues
+5. Only when all validations pass can you complete the task
+
+### What this means for you (the coder agent)
+
+- **Don't cut corners.** The QA agent will catch it. If you add a form field, make sure it actually submits and persists.
+- **Keep the dev server running.** The QA agent needs it for browser and API testing. Start it at the beginning of your session if needed.
+- **Write the full stack.** If the task requires frontend + API + DB changes, do all three. Don't leave the API handler half-done thinking "the tests pass."
+- **Don't fake completions.** Saying "I've verified everything works" doesn't bypass yanfu. It will verify itself.
+
+### Dev environment
+
+- Dev server: `DEV_SERVER_CMD` at `DEV_SERVER_URL`
+- Database: accessible via `DB_QUERY_CMD`
+- Browser: available via Playwright MCP
+- E2E tests: `npx playwright test`
+
+### Skipping validation
+
+If the human explicitly says to skip validation, set `YANFU_SKIP=1`. Otherwise, always go through the full validation loop.
