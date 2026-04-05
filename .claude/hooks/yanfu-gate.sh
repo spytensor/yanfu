@@ -38,7 +38,49 @@ if [ "${YANFU_SKIP:-0}" = "1" ]; then
 fi
 
 # ============================================================
-# Collect context
+# Read Stop hook input from stdin (JSON)
+# ============================================================
+
+# Claude Code passes a JSON object on stdin to Stop hooks:
+#   {
+#     "session_id": "...",
+#     "transcript_path": "/path/to/transcript.jsonl",
+#     "cwd": "/path/to/project",
+#     "hook_event_name": "Stop",
+#     "stop_hook_active": false,
+#     "last_assistant_message": "I've completed the implementation..."
+#   }
+
+HOOK_INPUT=$(cat)
+
+# Extract the assistant's final message -- this is the best signal
+# for what the coder agent thinks it accomplished.
+LAST_MESSAGE=""
+TRANSCRIPT_PATH=""
+if command -v jq &> /dev/null; then
+  LAST_MESSAGE=$(echo "$HOOK_INPUT" | jq -r '.last_assistant_message // empty' 2>/dev/null || echo "")
+  TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || echo "")
+else
+  # Fallback: rough extraction without jq
+  LAST_MESSAGE=$(echo "$HOOK_INPUT" | grep -o '"last_assistant_message":"[^"]*"' | head -1 | sed 's/"last_assistant_message":"//;s/"$//' || echo "")
+  TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | grep -o '"transcript_path":"[^"]*"' | head -1 | sed 's/"transcript_path":"//;s/"$//' || echo "")
+fi
+
+# Extract the original user task from the transcript.
+# The first user message is typically the task description.
+USER_TASK=""
+if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+  if command -v jq &> /dev/null; then
+    USER_TASK=$(jq -r 'select(.type == "human") | .message.content // empty' "$TRANSCRIPT_PATH" 2>/dev/null | head -1 || echo "")
+    # If empty, try alternate transcript format
+    if [ -z "$USER_TASK" ]; then
+      USER_TASK=$(head -20 "$TRANSCRIPT_PATH" | jq -r 'select(.role == "user") | .content // empty' 2>/dev/null | head -1 || echo "")
+    fi
+  fi
+fi
+
+# ============================================================
+# Collect context from git
 # ============================================================
 
 # What changed?
@@ -113,9 +155,11 @@ elif [ -f "go.mod" ]; then
   PROJECT_TYPE="go"
 fi
 
-# Read task description if available
+# Build task description from hook input + fallback files
 TASK_DESC=""
-if [ -f ".claude/current-task.md" ]; then
+if [ -n "$USER_TASK" ]; then
+  TASK_DESC="$USER_TASK"
+elif [ -f ".claude/current-task.md" ]; then
   TASK_DESC=$(cat .claude/current-task.md)
 elif [ -f ".claude/task" ]; then
   TASK_DESC=$(cat .claude/task)
@@ -162,8 +206,11 @@ fi
 # ============================================================
 
 CONTEXT=$(cat <<CTXEOF
-## Task Description
+## Original User Task
 ${TASK_DESC:-"No explicit task description found. Infer the task from the git diff."}
+
+## Coder Agent's Completion Message
+${LAST_MESSAGE:-"No completion message captured."}
 
 ## Project Type
 ${PROJECT_TYPE}

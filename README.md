@@ -132,13 +132,17 @@ Or add it to `~/.claude/settings.json` to make it available across all projects.
 
 ### The Stop Hook
 
-When Claude Code's coder agent finishes work and tries to hand control back to you, yanfu's Stop hook intercepts. It collects three pieces of context:
+When Claude Code's coder agent finishes work and tries to hand control back to you, yanfu's Stop hook intercepts. It reads the JSON payload from stdin (provided by Claude Code) and collects five pieces of context:
 
-1. **Task description** -- what was the agent asked to do?
-2. **Git diff** -- what actually changed?
-3. **Project context** -- what kind of project is this? (framework, database, etc.)
+1. **Original user task** -- extracted from the session transcript (the first user message)
+2. **Coder agent's completion message** -- what the agent claims it did (`last_assistant_message` from the Stop hook input)
+3. **Git diff** -- what actually changed in the code
+4. **Change scope** -- which layers were affected (frontend, backend, database, config)
+5. **Project context** -- framework type, CLAUDE.md contents, dev server URL
 
-This context is passed to the QA agent.
+All of this is passed to the QA agent, so it knows both what was asked and what was done. This is critical -- without the task context, the QA agent would only see the diff and have to guess the intent.
+
+**Dependency**: `jq` is recommended for reliable JSON parsing. Without it, the hook uses a regex fallback that handles simple cases but may miss multiline messages.
 
 ### The QA Agent
 
