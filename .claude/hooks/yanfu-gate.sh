@@ -53,6 +53,22 @@ fi
 
 HOOK_INPUT=$(cat)
 
+# jq is required for reliable JSON parsing.
+# last_assistant_message contains markdown, newlines, quotes --
+# regex-based extraction is not viable.
+if ! command -v jq &> /dev/null; then
+  echo "yanfu: WARNING -- jq not found, context extraction will be limited"
+  echo "yanfu: install jq for full functionality (brew install jq / apt install jq)"
+fi
+
+# --- Guard: prevent recursive invocation ---
+# When stop_hook_active is true, another Stop hook is already running
+# (e.g., the QA agent's own claude -p finishing). Exit immediately.
+STOP_HOOK_ACTIVE=$(echo "$HOOK_INPUT" | jq -r '.stop_hook_active // false' 2>/dev/null || echo "false")
+if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
+  exit 0
+fi
+
 # Extract the assistant's final message -- this is the best signal
 # for what the coder agent thinks it accomplished.
 LAST_MESSAGE=""
@@ -60,22 +76,16 @@ TRANSCRIPT_PATH=""
 if command -v jq &> /dev/null; then
   LAST_MESSAGE=$(echo "$HOOK_INPUT" | jq -r '.last_assistant_message // empty' 2>/dev/null || echo "")
   TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path // empty' 2>/dev/null || echo "")
-else
-  # Fallback: rough extraction without jq
-  LAST_MESSAGE=$(echo "$HOOK_INPUT" | grep -o '"last_assistant_message":"[^"]*"' | head -1 | sed 's/"last_assistant_message":"//;s/"$//' || echo "")
-  TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | grep -o '"transcript_path":"[^"]*"' | head -1 | sed 's/"transcript_path":"//;s/"$//' || echo "")
 fi
 
 # Extract the original user task from the transcript.
 # The first user message is typically the task description.
 USER_TASK=""
-if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
-  if command -v jq &> /dev/null; then
-    USER_TASK=$(jq -r 'select(.type == "human") | .message.content // empty' "$TRANSCRIPT_PATH" 2>/dev/null | head -1 || echo "")
-    # If empty, try alternate transcript format
-    if [ -z "$USER_TASK" ]; then
-      USER_TASK=$(head -20 "$TRANSCRIPT_PATH" | jq -r 'select(.role == "user") | .content // empty' 2>/dev/null | head -1 || echo "")
-    fi
+if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ] && command -v jq &> /dev/null; then
+  USER_TASK=$(jq -r 'select(.type == "human") | .message.content // empty' "$TRANSCRIPT_PATH" 2>/dev/null | head -1 || echo "")
+  # Try alternate transcript format
+  if [ -z "$USER_TASK" ]; then
+    USER_TASK=$(head -20 "$TRANSCRIPT_PATH" | jq -r 'select(.role == "user") | .content // empty' 2>/dev/null | head -1 || echo "")
   fi
 fi
 
@@ -84,19 +94,53 @@ fi
 # ============================================================
 
 # What changed?
-DIFF=$(git diff HEAD 2>/dev/null || echo "no git diff available")
-DIFF_STAT=$(git diff --stat HEAD 2>/dev/null || echo "")
-CHANGED_FILES=$(git diff --name-only HEAD 2>/dev/null || echo "")
+# Strategy: check uncommitted -> staged -> recent commits (last 10 min).
+# AI agents often commit before stopping, so git diff HEAD would be empty.
+DIFF=""
+DIFF_STAT=""
+CHANGED_FILES=""
+DIFF_SOURCE=""
 
-# If nothing changed, check staged
+# 1. Uncommitted changes
+CHANGED_FILES=$(git diff --name-only HEAD 2>/dev/null || echo "")
+if [ -n "$CHANGED_FILES" ]; then
+  DIFF_SOURCE="uncommitted"
+  DIFF=$(git diff HEAD 2>/dev/null || echo "")
+  DIFF_STAT=$(git diff --stat HEAD 2>/dev/null || echo "")
+fi
+
+# 2. Staged but not committed
 if [ -z "$CHANGED_FILES" ]; then
   CHANGED_FILES=$(git diff --cached --name-only 2>/dev/null || echo "")
-  if [ -z "$CHANGED_FILES" ]; then
-    echo "yanfu: no code changes detected, passing"
-    exit 0
+  if [ -n "$CHANGED_FILES" ]; then
+    DIFF_SOURCE="staged"
+    DIFF=$(git diff --cached 2>/dev/null || echo "")
+    DIFF_STAT=$(git diff --cached --stat 2>/dev/null || echo "")
   fi
-  DIFF=$(git diff --cached 2>/dev/null || echo "")
-  DIFF_STAT=$(git diff --cached --stat 2>/dev/null || echo "")
+fi
+
+# 3. Already committed -- check commits from the last 10 minutes.
+#    This catches the common case where the AI agent commits then stops.
+if [ -z "$CHANGED_FILES" ]; then
+  RECENT_COMMITS=$(git log --since="10 minutes ago" --format="%H" 2>/dev/null || echo "")
+  if [ -n "$RECENT_COMMITS" ]; then
+    # Get the oldest commit in the window; diff from its parent to HEAD
+    OLDEST_RECENT=$(echo "$RECENT_COMMITS" | tail -1)
+    PARENT="${OLDEST_RECENT}^"
+    # Verify parent exists (might be the initial commit)
+    if git rev-parse "$PARENT" &>/dev/null; then
+      DIFF_SOURCE="recent-commits"
+      CHANGED_FILES=$(git diff --name-only "$PARENT" HEAD 2>/dev/null || echo "")
+      DIFF=$(git diff "$PARENT" HEAD 2>/dev/null || echo "")
+      DIFF_STAT=$(git diff --stat "$PARENT" HEAD 2>/dev/null || echo "")
+    fi
+  fi
+fi
+
+# 4. Nothing found at all
+if [ -z "$CHANGED_FILES" ]; then
+  echo "yanfu: no code changes detected (uncommitted, staged, or recent commits), passing"
+  exit 0
 fi
 
 # Detect change scope
@@ -223,6 +267,9 @@ ${DEV_SERVER_URL}
 
 ## Database Query Command
 ${DB_QUERY_CMD:-"Not configured. Skip database validation."}
+
+## Diff Source
+${DIFF_SOURCE} (uncommitted / staged / recent-commits)
 
 ## Changed Files
 ${CHANGED_FILES}
