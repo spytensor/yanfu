@@ -218,14 +218,24 @@ In `.claude/agents/yanfu-qa.md`, you can adjust the QA agent's strictness:
 - smoke: Quick checks only -- page loads, no console errors, types pass.
 ```
 
-### Skipping Validation
+### Environment Variables
 
-For trivial changes (typos, comments, formatting), the QA agent automatically detects low-risk diffs and fast-tracks with a smoke check only.
+All behavior can be controlled via environment variables:
 
-To manually skip yanfu for a session:
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `YANFU_SKIP` | `0` | Set to `1` to skip validation entirely |
+| `YANFU_STRICTNESS` | `strict` | `strict` / `moderate` / `smoke` |
+| `YANFU_MODEL` | (default) | Model for QA agent, e.g. `claude-haiku-4-5-20251001` |
+| `YANFU_DEV_URL` | `http://localhost:3000` | Dev server URL |
+| `YANFU_DB_CMD` | (empty) | Database query command |
+| `YANFU_MAX_BUDGET` | `0.50` | Max budget in USD for QA agent |
+| `YANFU_COMMIT_WINDOW` | `30` | Minutes to look back for recent commits |
+
+Example: cheap QA with Haiku, moderate strictness:
 
 ```bash
-YANFU_SKIP=1 claude
+YANFU_MODEL=claude-haiku-4-5-20251001 YANFU_STRICTNESS=moderate claude
 ```
 
 ### Cost Considerations

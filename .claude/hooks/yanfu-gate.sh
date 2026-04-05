@@ -25,11 +25,18 @@ DEV_SERVER_URL="${YANFU_DEV_URL:-http://localhost:3000}"
 #   "sqlite3 ./db.sqlite3"
 DB_QUERY_CMD="${YANFU_DB_CMD:-}"
 
-# Max tokens for QA agent (controls cost)
-MAX_TOKENS="${YANFU_MAX_TOKENS:-16000}"
+# Max budget for QA agent in USD (controls cost)
+MAX_BUDGET="${YANFU_MAX_BUDGET:-0.50}"
 
 # Strictness: strict | moderate | smoke
 STRICTNESS="${YANFU_STRICTNESS:-strict}"
+
+# Model for QA agent (empty = use default)
+# Examples: "claude-haiku-4-5-20251001", "claude-sonnet-4-5-20250514"
+QA_MODEL="${YANFU_MODEL:-}"
+
+# How far back to look for commits when working tree is clean (minutes)
+COMMIT_WINDOW="${YANFU_COMMIT_WINDOW:-30}"
 
 # Skip flag
 if [ "${YANFU_SKIP:-0}" = "1" ]; then
@@ -94,7 +101,7 @@ fi
 # ============================================================
 
 # What changed?
-# Strategy: check uncommitted -> staged -> recent commits (last 10 min).
+# Strategy: check uncommitted -> staged -> recent commits.
 # AI agents often commit before stopping, so git diff HEAD would be empty.
 DIFF=""
 DIFF_STAT=""
@@ -119,10 +126,11 @@ if [ -z "$CHANGED_FILES" ]; then
   fi
 fi
 
-# 3. Already committed -- check commits from the last 10 minutes.
+# 3. Already committed -- check commits within the configured window.
 #    This catches the common case where the AI agent commits then stops.
+#    Default 30 min; override with YANFU_COMMIT_WINDOW.
 if [ -z "$CHANGED_FILES" ]; then
-  RECENT_COMMITS=$(git log --since="10 minutes ago" --format="%H" 2>/dev/null || echo "")
+  RECENT_COMMITS=$(git log --since="${COMMIT_WINDOW} minutes ago" --format="%H" 2>/dev/null || echo "")
   if [ -n "$RECENT_COMMITS" ]; then
     # Get the oldest commit in the window; diff from its parent to HEAD
     OLDEST_RECENT=$(echo "$RECENT_COMMITS" | tail -1)
@@ -170,14 +178,33 @@ fi
 # Fast-track: if only tests changed, just run them
 if [ "$HAS_TESTS_ONLY" = true ]; then
   echo "yanfu: only test files changed, running quick validation"
-  npm test 2>&1 || {
-    echo "========================================="
-    echo "YANFU BLOCKED: Tests are failing"
-    echo "========================================="
-    echo "You modified test files but they don't pass."
-    echo "Fix the tests before completing."
-    exit 2
-  }
+  TEST_CMD=""
+  if [ -f "package.json" ] && grep -q '"test"' package.json; then
+    TEST_CMD="npm test"
+  elif [ -f "manage.py" ]; then
+    TEST_CMD="python manage.py test"
+  elif [ -f "go.mod" ]; then
+    TEST_CMD="go test ./..."
+  elif [ -f "Cargo.toml" ]; then
+    TEST_CMD="cargo test"
+  elif [ -f "Gemfile" ]; then
+    TEST_CMD="bundle exec rake test"
+  elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+    TEST_CMD="python -m pytest"
+  fi
+
+  if [ -n "$TEST_CMD" ]; then
+    $TEST_CMD 2>&1 || {
+      echo "========================================="
+      echo "YANFU BLOCKED: Tests are failing"
+      echo "========================================="
+      echo "You modified test files but they don't pass."
+      echo "Fix the tests before completing."
+      exit 2
+    }
+  else
+    echo "yanfu: could not detect test runner, skipping fast-track"
+  fi
   exit 0
 fi
 
@@ -189,9 +216,9 @@ elif [ -f "nuxt.config.ts" ] || [ -f "nuxt.config.js" ]; then
   PROJECT_TYPE="nuxt"
 elif [ -f "astro.config.mjs" ] || [ -f "astro.config.ts" ]; then
   PROJECT_TYPE="astro"
-elif [ -f "manage.py" ] && [ -d "templates" ]; then
+elif [ -f "manage.py" ]; then
   PROJECT_TYPE="django"
-elif [ -f "app.py" ] || [ -f "main.py" ] && [ -f "requirements.txt" ]; then
+elif [ -f "requirements.txt" ] && { [ -f "app.py" ] || [ -f "main.py" ]; }; then
   PROJECT_TYPE="flask-or-fastapi"
 elif [ -f "Gemfile" ] && [ -d "app" ]; then
   PROJECT_TYPE="rails"
@@ -249,64 +276,53 @@ fi
 # Spawn the QA agent
 # ============================================================
 
-CONTEXT=$(cat <<CTXEOF
-## Original User Task
-${TASK_DESC:-"No explicit task description found. Infer the task from the git diff."}
+# Build the prompt in a temp file to avoid:
+#   - ARG_MAX limits (large diffs would blow up `claude -p "..."`)
+#   - Heredoc delimiter collisions (diff containing the delimiter)
+# Using printf '%s' to write data safely (no shell re-expansion).
 
-## Coder Agent's Completion Message
-${LAST_MESSAGE:-"No completion message captured."}
+PROMPT_FILE=$(mktemp "${TMPDIR:-/tmp}/yanfu-prompt.XXXXXX")
+trap 'rm -f "$PROMPT_FILE"' EXIT
 
-## Project Type
-${PROJECT_TYPE}
+# 1. QA agent system prompt
+cat "$QA_AGENT_PROMPT_FILE" > "$PROMPT_FILE"
 
-## Strictness Level
-${STRICTNESS}
+# 2. Context header
+printf '\n---\n\n# Current Validation Context\n\n' >> "$PROMPT_FILE"
 
-## Dev Server URL
-${DEV_SERVER_URL}
+# 3. Each section written with printf to keep data safe
+printf '## Original User Task\n%s\n\n' "${TASK_DESC:-No explicit task description found. Infer the task from the git diff.}" >> "$PROMPT_FILE"
+printf '## Coder Agent'\''s Completion Message\n%s\n\n' "${LAST_MESSAGE:-No completion message captured.}" >> "$PROMPT_FILE"
+printf '## Project Type\n%s\n\n' "$PROJECT_TYPE" >> "$PROMPT_FILE"
+printf '## Strictness Level\n%s\n\n' "$STRICTNESS" >> "$PROMPT_FILE"
+printf '## Dev Server URL\n%s\n\n' "$DEV_SERVER_URL" >> "$PROMPT_FILE"
+printf '## Database Query Command\n%s\n\n' "${DB_QUERY_CMD:-Not configured. Skip database validation.}" >> "$PROMPT_FILE"
+printf '## Diff Source\n%s (uncommitted / staged / recent-commits)\n\n' "$DIFF_SOURCE" >> "$PROMPT_FILE"
+printf '## Changed Files\n%s\n\n' "$CHANGED_FILES" >> "$PROMPT_FILE"
+printf '## Diff Summary\n%s\n\n' "$DIFF_STAT" >> "$PROMPT_FILE"
 
-## Database Query Command
-${DB_QUERY_CMD:-"Not configured. Skip database validation."}
+printf '## Change Scope\n' >> "$PROMPT_FILE"
+printf -- '- Frontend changed: %s\n' "$HAS_FRONTEND" >> "$PROMPT_FILE"
+printf -- '- Backend changed: %s\n' "$HAS_BACKEND" >> "$PROMPT_FILE"
+printf -- '- Database changed: %s\n' "$HAS_DATABASE" >> "$PROMPT_FILE"
+printf -- '- Config changed: %s\n\n' "$HAS_CONFIG" >> "$PROMPT_FILE"
 
-## Diff Source
-${DIFF_SOURCE} (uncommitted / staged / recent-commits)
+printf '## Full Diff\n```diff\n' >> "$PROMPT_FILE"
+echo "$DIFF" | head -500 >> "$PROMPT_FILE"
+printf '```\n\n' >> "$PROMPT_FILE"
 
-## Changed Files
-${CHANGED_FILES}
+printf '## Project Context (from CLAUDE.md)\n%s\n' "${PROJECT_CONTEXT:-No CLAUDE.md found.}" >> "$PROMPT_FILE"
 
-## Diff Summary
-${DIFF_STAT}
+# Build claude CLI arguments
+CLAUDE_ARGS=(--output-format text --max-budget-usd "$MAX_BUDGET")
+if [ -n "$QA_MODEL" ]; then
+  CLAUDE_ARGS+=(--model "$QA_MODEL")
+fi
 
-## Change Scope
-- Frontend changed: ${HAS_FRONTEND}
-- Backend changed: ${HAS_BACKEND}
-- Database changed: ${HAS_DATABASE}
-- Config changed: ${HAS_CONFIG}
-
-## Full Diff
-\`\`\`diff
-$(echo "$DIFF" | head -500)
-\`\`\`
-
-## Project Context (from CLAUDE.md)
-${PROJECT_CONTEXT:-"No CLAUDE.md found."}
-CTXEOF
-)
-
-QA_PROMPT=$(cat "$QA_AGENT_PROMPT_FILE")
-
-FULL_PROMPT="${QA_PROMPT}
-
----
-
-# Current Validation Context
-
-${CONTEXT}"
-
-# Run the QA agent via claude CLI.
-# The agent inherits MCP servers from the project's .claude/settings.json
+# Pipe the prompt via stdin to avoid ARG_MAX.
+# The agent inherits MCP servers from .claude/settings.json
 # or ~/.claude/settings.json. Ensure Playwright MCP is configured there.
-RESULT=$(claude -p "$FULL_PROMPT" --max-tokens "$MAX_TOKENS" --output-format text 2>&1) || true
+RESULT=$(claude -p - "${CLAUDE_ARGS[@]}" < "$PROMPT_FILE" 2>&1) || true
 
 # ============================================================
 # Parse result -- only trust explicit VERDICT markers
